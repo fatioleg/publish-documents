@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import hashlib
+import html
 import json
 import os
 import re
@@ -25,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import zipfile
+from collections import Counter
 from pathlib import Path
 
 try:
@@ -33,7 +35,7 @@ except ImportError:  # pragma: no cover
     print("pubdoc precisa de PyYAML: python3 -m pip install pyyaml", file=sys.stderr)
     raise SystemExit(2)
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SKILL = Path(__file__).resolve().parents[1]
 TEMPLATES = SKILL / "templates"
 PROFILES = {
@@ -43,6 +45,11 @@ PROFILES = {
 }
 CSL_FILES = {"abnt": "associacao-brasileira-de-normas-tecnicas.csl", "acs": "american-chemical-society.csl"}
 FORMAT_EXT = {"report-typst": "pdf", "typst": "pdf", "pdf": "pdf", "docx": "docx"}
+DOCX_STYLES = {"tecnico": "reference-tecnico.docx", "abnt": "reference-abnt.docx"}
+EQ_FILTER = TEMPLATES / "filters" / "eq-tags.lua"
+EQ_TAG_RE = re.compile(r"\\tag(\*?)\s*\{((?:[^{}]|\{[^{}]*\})*)\}")
+EQ_MARK_RE = re.compile(r"⟦EQTAG(\*?):([^⟧]*)⟧")
+BODY_STYLES = {"BodyText", "FirstParagraph", "Normal", None}
 CROSSREF_PREFIXES = ("fig-", "tbl-", "eq-", "sec-", "lst-", "thm-", "lem-", "cor-", "prp-", "cnj-", "def-",
                      "exm-", "exr-")
 
@@ -115,7 +122,8 @@ def doc_paths(root: Path) -> tuple[Path, Path]:
 
 # --------------------------------------------------------------------- new
 
-def scaffold_meta(profile: str, title: str, lang: str, csl_name: str, with_docx: bool) -> dict:
+def scaffold_meta(profile: str, title: str, lang: str, csl_name: str, with_docx: bool,
+                  docx_style: str = "tecnico") -> dict:
     meta: dict = {
         "title": title,
         "author": [{"name": "Autor responsável", "affiliations": ["Instituição"]}],
@@ -136,8 +144,9 @@ def scaffold_meta(profile: str, title: str, lang: str, csl_name: str, with_docx:
         fmts["pdf"] = {"pdf-engine": "xelatex", "keep-tex": True, "number-sections": True,
                        "documentclass": "article", "papersize": "a4", "geometry": ["margin=2.5cm"]}
     if profile == "word-editable" or with_docx:
-        fmts["docx"] = {"reference-doc": "templates/reference-abnt.docx", "toc": profile == "word-editable",
-                        "number-sections": True}
+        # sumário só no ABNT: no DOCX ele é um campo que o Word preenche ao abrir (o LibreOffice mostra vazio)
+        fmts["docx"] = {"reference-doc": f"templates/{DOCX_STYLES[docx_style]}",
+                        "toc": profile == "word-editable" and docx_style == "abnt", "number-sections": True}
     meta["format"] = fmts
     return meta
 
@@ -180,7 +189,8 @@ SVG = ('<svg xmlns="http://www.w3.org/2000/svg" width="400" height="160"><rect w
        'Substitua por uma figura real</text></svg>')
 
 
-def cmd_new(root: Path, profile: str, title: str, lang: str, csl: str | None, with_docx: bool, force: bool) -> None:
+def cmd_new(root: Path, profile: str, title: str, lang: str, csl: str | None, with_docx: bool, force: bool,
+            docx_style: str = "tecnico") -> None:
     if profile not in PROFILES:
         raise PubError(f"perfil desconhecido {profile!r}; use {', '.join(PROFILES)}")
     root = root.resolve()
@@ -198,9 +208,10 @@ def cmd_new(root: Path, profile: str, title: str, lang: str, csl: str | None, wi
             shutil.rmtree(dest)
         shutil.copytree(TEMPLATES / "_extensions" / "uah" / "report", dest)
     if profile == "word-editable" or with_docx:
-        shutil.copy2(TEMPLATES / "word" / "reference-abnt.docx", root / "templates" / "reference-abnt.docx")
+        ref = DOCX_STYLES[docx_style]
+        shutil.copy2(TEMPLATES / "word" / ref, root / "templates" / ref)
     if not (root / "document.qmd").exists():
-        meta = scaffold_meta(profile, title, lang, csl_name, with_docx)
+        meta = scaffold_meta(profile, title, lang, csl_name, with_docx, docx_style)
         text = "---\n" + yaml.safe_dump(meta, allow_unicode=True, sort_keys=False) + "---\n" + BODY
         (root / "document.qmd").write_text(text, encoding="utf-8")
         (root / "references.bib").write_text(BIB, encoding="utf-8")
@@ -208,7 +219,8 @@ def cmd_new(root: Path, profile: str, title: str, lang: str, csl: str | None, wi
     quarto_yml = root / "_quarto.yml"
     if not quarto_yml.exists():
         quarto_yml.write_text(f"project:\n  type: default\n  output-dir: outputs\nlang: {lang}\n", encoding="utf-8")
-    print(f"new: {root} · perfil {profile} · citação {csl_name}" + (" · +docx" if with_docx else ""))
+    docx_note = f" · docx {docx_style}" if profile == "word-editable" or with_docx else ""
+    print(f"new: {root} · perfil {profile} · citação {csl_name}{docx_note}")
     print("Próximos passos: escreva document.qmd → pubdoc.py preflight → pubdoc.py render → pubdoc.py verify")
 
 
@@ -219,6 +231,16 @@ LABEL_RE = re.compile(r"\{[^}]*#((?:%s)[\w-]+)[^}]*\}" % "|".join(CROSSREF_PREFI
 CHUNK_LABEL_RE = re.compile(r"^#\|\s*label:\s*((?:%s)[\w-]+)\s*$" % "|".join(CROSSREF_PREFIXES), re.M)
 IMG_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)(\{[^}]*\})?")
 BIB_KEY_RE = re.compile(r"@\w+\s*\{\s*([^,\s]+)\s*,")
+
+
+def included_texts(root: Path, body: str) -> list[str]:
+    """Conteúdo dos arquivos de {{< include … >}} (um nível), para contar \\tag e rótulos também neles."""
+    out = []
+    for rel in re.findall(r"\{\{<\s*include\s+([^\s>]+)\s*>\}\}", body):
+        path = root / rel
+        if path.is_file():
+            out.append("\n" + path.read_text(encoding="utf-8"))
+    return out
 
 
 def strip_code(body: str) -> str:
@@ -251,6 +273,24 @@ def cmd_preflight(root: Path) -> int:
         add("FAIL", f"estilo CSL não encontrado: {csl}")
 
     text = strip_code(body)
+    numbered = any(isinstance(cfg, dict) and cfg.get("number-sections")
+                   for cfg in ((meta.get("format") or {}).values() if isinstance(meta.get("format"), dict) else []))
+    numbered = numbered or bool(meta.get("number-sections"))
+    hand = [h for h in re.findall(r"(?m)^#{1,6}\s+(.+)$", text)
+            if not re.search(r"\{(?:[^}]*\s)?(?:-|\.unnumbered)(?:\s[^}]*)?\}\s*$", h)
+            and re.match(r"(\d+\.(\d+\.?)*|\d+(\.\d+)+|[A-Z]\.\d+(\.\d+)*\.?|[IVXLC]+\.|Parte\s+([A-Z]|[IVXLC]+)\b)(\s|$)", h)]
+    if numbered and hand:
+        add("FAIL", f"{len(hand)} título(s) já numerados à mão (ex.: «{hand[0][:40]}») com number-sections: true "
+                    "— a numeração sai dupla; desligue number-sections ou marque-os com {{.unnumbered}}")
+    full = text + "".join(included_texts(root, body))
+    tags = expected_tags(full)
+    if tags:
+        add("INFO", f"{len(tags)} equação(ões) com \\tag{{}}: numeradas no PDF pelo LaTeX e no DOCX pelo pubdoc")
+    for m in re.finditer(r"\$\$((?:(?!\$\$).)*?)\$\$\s*\{[^}]*#eq-([\w-]+)", full, re.S):
+        if EQ_TAG_RE.search(m.group(1)):
+            add("FAIL", f"equação #eq-{m.group(2)} tem \\tag e rótulo do Quarto ao mesmo tempo: use um dos dois")
+    for env in re.findall(r"\\begin\{(equation|align|gather|multline)\*?\}(?:(?!\\end\{).)*?\\tag", full, re.S):
+        add("WARN", f"\\tag dentro de \\begin{{{env}}} cru: o DOCX perde essa equação; use $$ … \\tag{{n}} $$")
     labels = set(LABEL_RE.findall(text)) | set(CHUNK_LABEL_RE.findall(body))
     refs = set(CITE_RE.findall(text))
     crossrefs = {r for r in refs if r.startswith(CROSSREF_PREFIXES)}
@@ -337,6 +377,113 @@ def svg_to_pdf(root: Path, body: str) -> list[str]:
     return notes
 
 
+def _docx_text_width(xml: str) -> int:
+    """Largura útil da página em twips (sectPr do documento; A4 com 2,3 cm se ausente)."""
+    w = re.search(r'<w:pgSz\b[^>]*\bw:w="(\d+)"', xml)
+    left = re.search(r'<w:pgMar\b[^>]*\bw:left="(\d+)"', xml)
+    right = re.search(r'<w:pgMar\b[^>]*\bw:right="(\d+)"', xml)
+    if w and left and right:
+        return int(w.group(1)) - int(left.group(1)) - int(right.group(1))
+    return 11906 - 2 * 1304
+
+
+def _tag_plain(tex: str) -> str:
+    """Texto exibido de um \\tag (mesma regra do eq-tags.lua): \\text{K} → K, sem chaves."""
+    for _ in range(5):
+        new = re.sub(r"\\[A-Za-z]+\s*\{([^{}]*)\}", r"\1", tex)
+        if new == tex:
+            break
+        tex = new
+    return re.sub(r"[{}]", "", re.sub(r"\\([%&#_$'])", r"\1", tex))
+
+
+def expected_tags(body: str) -> list[str]:
+    """Números esperados (como aparecem no documento) para cada \\tag do texto, sem código nem comentários."""
+    text = re.sub(r"<!--.*?-->", "", strip_code(body), flags=re.S)
+    return [_tag_plain(t) if star else f"({_tag_plain(t)})" for star, t in EQ_TAG_RE.findall(text)]
+
+
+def _number_part(xml: str, width: int) -> tuple[str, int]:
+    paras = list(re.finditer(r"<w:p(?:\s[^>]*)?>(?:(?!</w:p>).)*?</w:p>", xml, re.S))
+    cell_edges = [(m.start(), -1 if m.group(1) else 1) for m in re.finditer(r"<(/)?w:tc[\s>]", xml)]
+
+    def in_cell(pos: int) -> bool:  # dentro de <w:tc> … </w:tc>
+        return sum(step for at, step in cell_edges if at < pos) > 0
+
+    count, pieces, cursor = 0, [], 0
+    for eq_m, nxt_m in zip(paras, paras[1:]):
+        eq, nxt = eq_m.group(0), nxt_m.group(0)
+        mark = EQ_MARK_RE.search(nxt)
+        omath = re.search(r"<m:oMathPara>.*?(<m:oMath>.*</m:oMath>).*?</m:oMathPara>", eq, re.S)
+        if not mark or not omath or eq_m.start() < cursor or xml[eq_m.end():nxt_m.start()].strip():
+            continue
+        label = mark.group(2) if mark.group(1) else f"({mark.group(2)})"  # já vem escapado do XML
+        ppr_m = re.search(r"<w:pPr>.*?</w:pPr>|<w:pPr\s*/>", eq, re.S)
+        ppr = ppr_m.group(0) if ppr_m else ""
+        style_m = re.search(r'<w:pStyle w:val="([^"]+)"\s*/>', ppr)
+        marks = "".join(re.findall(r"<w:bookmark(?:Start|End)\b[^>]*/>", eq))
+        # item de lista só com a equação: o Pandoc põe o numPr no parágrafo do marcador, não no da equação
+        nxt_numpr = re.search(r"<w:numPr>.*?</w:numPr>", nxt, re.S)
+        if nxt_numpr and "<w:numPr>" not in ppr:
+            ppr = ppr or "<w:pPr></w:pPr>"
+            at = ppr.index(style_m.group(0)) + len(style_m.group(0)) if style_m else len("<w:pPr>")
+            ppr = ppr[:at] + nxt_numpr.group(0) + ppr[at:]
+            nxt = nxt.replace(nxt_numpr.group(0), "", 1)
+            mark = EQ_MARK_RE.search(nxt)
+        plain_para = (style_m.group(1) if style_m else None) in BODY_STYLES and "<w:numPr>" not in ppr \
+            and not in_cell(eq_m.start())
+        if plain_para:  # ⇥ equação ⇥ (n): tabulação central no meio da linha e direita na margem
+            new_eq = ("<w:p><w:pPr>" + (style_m.group(0) if style_m else "")
+                      + f'<w:tabs><w:tab w:val="center" w:pos="{width // 2}"/>'
+                      + f'<w:tab w:val="right" w:pos="{width}"/></w:tabs>'
+                      + '<w:ind w:left="0" w:right="0" w:firstLine="0"/><w:jc w:val="left"/></w:pPr>'
+                      + marks + "<w:r><w:tab/></w:r>" + omath.group(1) + "<w:r><w:tab/></w:r>"
+                      + f'<w:r><w:t xml:space="preserve">{label}</w:t></w:r></w:p>')
+        else:  # lista, quadro ou célula: mantém a geometria do parágrafo; número logo após a equação
+            new_eq = (f"<w:p>{ppr}{marks}" + omath.group(1)
+                      + f'<w:r><w:t xml:space="preserve"> {label}</w:t></w:r></w:p>')
+        # tira o marcador e só o espaço que vem logo depois dele (no mesmo texto ou no início do próximo)
+        rest = nxt[:mark.start()] + re.sub(r"^\s+", "", nxt[mark.end():])
+        tail = rest[mark.start():]
+        if tail.startswith("</w:t>"):
+            tail = re.sub(r"^(</w:t>.*?<w:t(?:\s[^>]*)?>)\s+", r"\1", tail, count=1, flags=re.S) \
+                if re.match(r"^</w:t>\s*</w:r>\s*<w:r>(?:(?!<w:t[\s>]).)*?<w:t[\s>]", tail, re.S) else tail
+            rest = rest[:mark.start()] + tail
+        texts = "".join(re.findall(r"<w:t(?:\s[^>]*)?>([^<]*)</w:t>", rest))
+        if not texts.strip() and not re.search(r"<m:oMath|<w:drawing|<w:hyperlink|<w:bookmark", rest):
+            rest = ""  # o parágrafo só tinha o marcador
+        pieces += [xml[cursor:eq_m.start()], new_eq, xml[eq_m.end():nxt_m.start()], rest]
+        cursor = nxt_m.end()
+        count += 1
+    return "".join(pieces) + xml[cursor:], count
+
+
+def docx_number_equations(docx: Path) -> tuple[int, int]:
+    """Troca o marcador ⟦EQTAG:n⟧ (eq-tags.lua) pelo número da equação.
+
+    O Pandoc põe a equação num parágrafo próprio (m:oMathPara) e o marcador no parágrafo seguinte.
+    Em parágrafo de corpo, a equação vira m:oMath entre tabulações: ⇥ equação ⇥ (n). Em lista, quadro
+    ou célula de tabela, o parágrafo mantém a formatação e o número vem logo após a equação.
+    Processa o corpo e as notas de rodapé. Devolve (numeradas, marcadores que sobraram).
+    """
+    parts = ("word/document.xml", "word/footnotes.xml", "word/endnotes.xml")
+    with zipfile.ZipFile(docx) as zf:
+        items = [(info, zf.read(info.filename)) for info in zf.infolist()]
+    texts = {info.filename: data.decode("utf-8") for info, data in items if info.filename in parts}
+    width = _docx_text_width(texts.get("word/document.xml", ""))
+    count = left = 0
+    for name, xml in texts.items():
+        texts[name], n = _number_part(xml, width)
+        count += n
+        left += len(EQ_MARK_RE.findall(texts[name]))
+    tmp = docx.with_suffix(".tmp.docx")
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+        for info, data in items:
+            zf.writestr(info, texts[info.filename].encode("utf-8") if info.filename in texts else data)
+    tmp.replace(docx)
+    return count, left
+
+
 def cmd_render(root: Path, all_formats: bool, to: str | None) -> int:
     root, qmd = doc_paths(root)
     meta, body = front_matter(qmd)
@@ -349,10 +496,21 @@ def cmd_render(root: Path, all_formats: bool, to: str | None) -> int:
         if fmt == "pdf":
             for path in svg_to_pdf(root, body):
                 print(f"svg→pdf: {path} (para o LaTeX)")
-        out = run(["quarto", "render", qmd.name, "--to", fmt], cwd=root)
+        extra = ["-L", str(EQ_FILTER)] if fmt == "docx" else []
+        out = run(["quarto", "render", qmd.name, "--to", fmt, *extra], cwd=root)
         ok = out.returncode == 0
+        note = ""
+        if ok and fmt == "docx":
+            docx = next((p for p in (root / "outputs" / f"{qmd.stem}.docx", root / f"{qmd.stem}.docx") if p.is_file()), None)
+            if docx is None:
+                ok, note = False, " (DOCX não encontrado depois do render)"
+            else:
+                numbered, left = docx_number_equations(docx)
+                note = f" ({numbered} equação(ões) numerada(s))" if numbered else ""
+                if left:
+                    ok, note = False, f" ({left} marcador(es) de \\tag sem equação antes — veja o verify)"
         status |= 0 if ok else 1
-        print(f"render {fmt}: {'OK' if ok else 'FALHOU'}")
+        print(f"render {fmt}: {'OK' if ok else 'FALHOU'}{note}")
         if not ok:
             print("\n".join((out.stderr or out.stdout).strip().splitlines()[-15:]))
     return status
@@ -420,7 +578,7 @@ def pdf_checks(pdf: Path, review: Path, page_limit, add) -> int:
     return pages or 0
 
 
-def docx_checks(docx: Path, review: Path, page_limit, add) -> None:
+def docx_checks(docx: Path, review: Path, page_limit, add, tags: list[str] | None = None) -> None:
     try:
         with zipfile.ZipFile(docx) as zf:
             bad = zf.testzip()
@@ -438,6 +596,21 @@ def docx_checks(docx: Path, review: Path, page_limit, add) -> None:
     add("OK", f"{docx.name}: OOXML íntegro · {headings} título(s) · {images} imagem(ns) · {equations} equação(ões)")
     if "?@" in xml:
         add("FAIL", f"{docx.name}: referência cruzada não resolvida (?@…)")
+    with zipfile.ZipFile(docx) as zf:
+        notes = "".join(zf.read(n).decode("utf-8", "replace") for n in ("word/footnotes.xml", "word/endnotes.xml")
+                        if n in names)
+    leftover = len(EQ_MARK_RE.findall(xml + notes))
+    if leftover:
+        add("FAIL", f"{docx.name}: {leftover} marcador(es) ⟦EQTAG⟧ no texto — renderize com `pubdoc.py render`")
+    if tags:
+        found = Counter(html.unescape(t) for t in re.findall(
+            r'</m:oMath>(?:<w:r><w:tab/></w:r>)?<w:r><w:t xml:space="preserve"> ?([^<]*)</w:t></w:r>', xml + notes))
+        missing = list((Counter(tags) - found).elements())
+        if missing:
+            add("FAIL", f"{docx.name}: {len(missing)} de {len(tags)} equação(ões) com \\tag sem número no DOCX "
+                        f"(ex.: {', '.join(missing[:5])})")
+        else:
+            add("OK", f"{docx.name}: {len(tags)} equação(ões) numerada(s) com \\tag")
     soffice = shutil.which("soffice") or shutil.which("libreoffice")
     if not soffice:
         add("WARN", f"{docx.name}: LibreOffice ausente — sem prévia visual do DOCX")
@@ -464,8 +637,9 @@ def docx_checks(docx: Path, review: Path, page_limit, add) -> None:
 
 def cmd_verify(root: Path) -> int:
     root, qmd = doc_paths(root)
-    meta, _ = front_matter(qmd)
+    meta, body = front_matter(qmd)
     profile = profile_of(meta)
+    expected = expected_tags(body + "".join(included_texts(root, body)))
     page_limit = (meta.get("uah-publish") or {}).get("page-limit")
     outdir = root / "outputs"
     review = outdir / "_review"
@@ -474,9 +648,9 @@ def cmd_verify(root: Path) -> int:
     review.mkdir(parents=True)
     results: list[tuple[str, str]] = []
     add = lambda level, msg: results.append((level, msg))  # noqa: E731
-    expected = sorted({FORMAT_EXT.get(f, f) for f in formats_of(meta)})
+    exts = sorted({FORMAT_EXT.get(f, f) for f in formats_of(meta)})
     outputs = []
-    for ext in expected:
+    for ext in exts:
         path = outdir / f"{qmd.stem}.{ext}"
         if not path.is_file() or path.stat().st_size == 0:
             primary_ext = PROFILES[profile]["ext"]
@@ -489,7 +663,7 @@ def cmd_verify(root: Path) -> int:
         if ext == "pdf":
             pdf_checks(path, review, page_limit, add)
         elif ext == "docx":
-            docx_checks(path, review, page_limit, add)
+            docx_checks(path, review, page_limit, add, expected)
 
     sources = [qmd, root / "_quarto.yml"]
     bibs = meta.get("bibliography") or []
@@ -582,6 +756,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--lang", default="pt-BR")
     p.add_argument("--csl", choices=list(CSL_FILES), help="estilo de citação (padrão do perfil)")
     p.add_argument("--with-docx", action="store_true", help="habilita também a saída DOCX editável")
+    p.add_argument("--docx-style", choices=list(DOCX_STYLES), default="tecnico",
+                   help="estilo do DOCX: tecnico (padrão; Cambria, tabelas booktabs, quadros) ou abnt")
     p.add_argument("--force", action="store_true", help="recopia templates sem tocar no texto")
     sub.add_parser("doctor", help="testa as ferramentas instaladas")
     for name in ("preflight", "verify"):
@@ -594,7 +770,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.cmd == "new":
-            cmd_new(Path(args.dir), args.profile, args.title, args.lang, args.csl, args.with_docx, args.force)
+            cmd_new(Path(args.dir), args.profile, args.title, args.lang, args.csl, args.with_docx, args.force,
+                    args.docx_style)
             return 0
         if args.cmd == "doctor":
             return cmd_doctor()

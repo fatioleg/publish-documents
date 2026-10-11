@@ -9,6 +9,7 @@ porque depende do ambiente e não da lógica.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -48,13 +49,24 @@ class NewAndPreflight(Base):
         pub = self.new("report-visual", "--with-docx")
         for rel in ("document.qmd", "references.bib", "_quarto.yml", "assets/exemplo.svg",
                     "csl/associacao-brasileira-de-normas-tecnicas.csl", "_extensions/uah/report/_extension.yml",
-                    "templates/reference-abnt.docx"):
+                    "templates/reference-tecnico.docx"):
             self.assertTrue((pub / rel).is_file(), rel)
         journal = sh("new", "art", "--profile", "journal-scientific", cwd=self.root)
         self.assertEqual(journal.returncode, 0, journal.stderr)
         self.assertTrue((self.root / "art/csl/american-chemical-society.csl").is_file())
         self.assertFalse((self.root / "art/_extensions").exists())
         self.assertIn("xelatex", (self.root / "art/document.qmd").read_text())
+
+    def test_docx_style_choice_and_hand_numbered_headings(self):
+        pub = self.new("word-editable", "--docx-style", "abnt")
+        self.assertTrue((pub / "templates/reference-abnt.docx").is_file())
+        self.assertIn("reference-abnt.docx", (pub / "document.qmd").read_text())
+        self.edit(pub, "# Introdução", "# 1. Introdução")
+        out = sh("preflight", "pub", cwd=self.root)
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("já numerados à mão", out.stdout)
+        self.edit(pub, "number-sections: true", "number-sections: false")
+        self.assertNotIn("já numerados à mão", sh("preflight", "pub", cwd=self.root).stdout)
 
     def test_new_refuses_to_overwrite_text(self):
         pub = self.new()
@@ -132,6 +144,67 @@ class RenderIntegration(Base):
     def test_word_editable_docx(self):
         _pub, report = self.render_and_verify("word-editable")
         self.assertIn("1 equação(ões)", report)
+
+    def test_docx_keeps_tag_numbers_right_aligned(self):
+        pub = self.new("word-editable")
+        self.edit(pub, "$$ E = mc^2 $$ {#eq-exemplo}",
+                  "$$ E = mc^2 $$ {#eq-exemplo}\n\nAntes $$a = b + c. \\tag{143}$$ depois.\n\n"
+                  "$$x = y. \\tag{144a}$$\n\n$$z = w. \\tag{145}$$\n\nComo (143) mostra.")
+        out = sh("render", "pub", cwd=self.root)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("3 equação(ões) numerada(s)", out.stdout)
+        ver = sh("verify", "pub", cwd=self.root)
+        self.assertEqual(ver.returncode, 0, ver.stdout)
+        self.assertIn("3 equação(ões) numerada(s) com \\tag", ver.stdout)
+        import xml.etree.ElementTree as ET
+        import zipfile
+        with zipfile.ZipFile(pub / "outputs/document.docx") as zf:
+            xml = zf.read("word/document.xml").decode()
+        ET.fromstring(xml)  # continua XML válido
+        for tag in ("(143)", "(144a)", "(145)"):
+            self.assertIn(f'<w:t xml:space="preserve">{tag}</w:t>', xml)
+        self.assertNotIn("EQTAG", xml)
+        self.assertIn("depois.", xml)
+        # um render fora do pubdoc (sem o filtro) perde os números: o verify reprova
+        subprocess.run(["quarto", "render", "document.qmd", "--to", "docx"], cwd=pub, capture_output=True)
+        ver = sh("verify", "pub", cwd=self.root)
+        self.assertEqual(ver.returncode, 1)
+        self.assertIn("com \\tag sem número no DOCX", ver.stdout)
+
+    def test_docx_tag_edge_cases(self):
+        pub = self.new("word-editable")
+        self.edit(pub, "$$ E = mc^2 $$ {#eq-exemplo}",
+                  "$$ E = mc^2 $$ {#eq-exemplo}\n\n"
+                  "$$F = ma \\tag{2}$$, em que **F** é a força.\n\n"
+                  "$$a' = b \\tag{9'}$$\n\n$$p = q \\tag{A\\&B}$$\n\n$$k = 1 \\tag{\\text{K}}$$\n\n"
+                  "$$s = t \\tag*{8}$$\n\n- item $$x = 1 \\tag{3}$$\n\n- $$u = 6 \\tag{6}$$\n- segundo item\n\n> Quadro $$y = 2 \\tag{4}$$\n\n"
+                  "Nota.[^n]\n\n[^n]: Na nota $$z = 3 \\tag{5}$$\n\n<!-- $$w \\tag{99}$$ -->\n")
+        out = sh("render", "pub", cwd=self.root)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        ver = sh("verify", "pub", cwd=self.root)
+        self.assertEqual(ver.returncode, 0, ver.stdout)
+        import zipfile
+        with zipfile.ZipFile(pub / "outputs/document.docx") as zf:
+            xml = zf.read("word/document.xml").decode()
+            notes = zf.read("word/footnotes.xml").decode()
+        self.assertIn(", em que", xml)
+        self.assertIn('em que</w:t></w:r><w:r><w:t xml:space="preserve"> </w:t>', xml)  # espaço antes de **F** mantido
+        self.assertTrue("(9&#39;)" in xml or "(9')" in xml)
+        self.assertIn("(A&amp;B)", xml)
+        self.assertIn("(K)", xml)
+        self.assertIn('xml:space="preserve">8</w:t>', xml)
+        self.assertIn("(5)", notes)
+        self.assertNotIn("EQTAG", xml + notes)
+        self.assertIn("<w:numPr>", xml)  # o item de lista continua na lista
+        eq6 = re.search(r"<w:p>(?:(?!</w:p>).)*? \(6\)</w:t></w:r></w:p>", xml, re.S).group(0)
+        self.assertIn("<w:numPr>", eq6)  # item só com a equação mantém o marcador de lista
+
+    def test_preflight_tag_with_quarto_label_fails(self):
+        pub = self.new("word-editable")
+        self.edit(pub, "$$ E = mc^2 $$ {#eq-exemplo}", "$$ E = mc^2 \\tag{7} $$ {#eq-exemplo}")
+        out = sh("preflight", "pub", cwd=self.root)
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("tem \\tag e rótulo do Quarto", out.stdout)
 
     def test_page_limit_enforced(self):
         pub = self.new("report-visual")

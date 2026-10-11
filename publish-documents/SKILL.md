@@ -1,6 +1,6 @@
 ---
 name: publish-documents
-description: "Publicação profissional de documentos (PDF e DOCX) a partir de uma fonte única em Quarto (.qmd): relatórios científicos e institucionais com design (Typst), artigos teóricos com equações e template de periódico (LaTeX), documentos editáveis e editais em Word com ABNT. Inclui preflight (citações, referências cruzadas, figuras, texto alternativo), compilação determinística, verificação das saídas (páginas, fontes embutidas, referências não resolvidas), folha de contato para inspeção visual e manifesto de proveniência. Use quando o usuário pedir para gerar, formatar, diagramar ou entregar um relatório, artigo, parecer, proposta ou projeto de fomento em PDF ou Word — mesmo sem dizer Quarto."
+description: "Publicação profissional de documentos (PDF e DOCX) a partir de uma fonte única em Quarto (.qmd): relatórios científicos e institucionais com design (Typst), artigos teóricos com equações e template de periódico (LaTeX), documentos editáveis em Word (estilo técnico ou ABNT, com números de equação preservados). Inclui preflight (citações, referências cruzadas, figuras, texto alternativo), compilação determinística, verificação das saídas (páginas, fontes embutidas, referências não resolvidas), folha de contato para inspeção visual e manifesto de proveniência. Use quando o usuário pedir para gerar, formatar, diagramar ou entregar um relatório, artigo, parecer, proposta ou projeto de fomento em PDF ou Word — mesmo sem dizer Quarto."
 ---
 
 # publish-documents — protocolo editorial (não um sistema editorial)
@@ -16,7 +16,7 @@ CLI: `python3 <skill>/scripts/pubdoc.py`. `<skill>` é a pasta deste arquivo, po
 |---|---|---|
 | `report-visual` | Quarto → Typst → PDF (capa, índice, cor de destaque) | relatório científico, técnico ou institucional; proposta em PDF livre; relatório de modelagem molecular |
 | `journal-scientific` | Quarto → XeLaTeX → PDF (+ `.tex`) | artigo teórico com muitas equações; submissão em LaTeX. **Template oficial da revista tem precedência** |
-| `word-editable` | Quarto/Pandoc → DOCX (`reference-abnt.docx`) | parecer, relatório institucional editável, edital que exige Word |
+| `word-editable` | Quarto/Pandoc → DOCX: `--docx-style tecnico` (padrão; Cambria, tabelas booktabs, `>` vira quadro sombreado) ou `abnt` | texto técnico ou científico editável, parecer, edital que exige Word (ABNT só quando exigido) |
 
 Regras de decisão:
 - O template exigido pelo destinatário (revista, agência, edital) **manda**.
@@ -27,12 +27,14 @@ Regras de decisão:
 ## Fluxo
 
 1. **Ambiente (uma vez por máquina):** rode `pubdoc.py doctor`. Ele testa de verdade o Quarto, o Typst, os motores TeX e o LibreOffice. Se um motor falhar, use outro (ex.: o LuaLaTeX quebrado nesta máquina; o XeLaTeX é o padrão).
-2. **Estrutura:** `pubdoc.py new publication --profile <perfil> --title "..." [--with-docx] [--csl abnt|acs]`. Isso cria `publication/{document.qmd, references.bib, _quarto.yml, assets/, csl/, templates/, outputs/}`.
+2. **Estrutura:** `pubdoc.py new publication --profile <perfil> --title "..." [--with-docx] [--docx-style tecnico|abnt] [--csl abnt|acs]`. Isso cria `publication/{document.qmd, references.bib, _quarto.yml, assets/, csl/, templates/, outputs/}`.
 3. **Redação:** escreva em `document.qmd`.
    - Citações `[@chave]`; rótulos `{#fig-x}`, `{#tbl-x}`, `{#eq-x}`; referências `@fig-x`.
    - Toda figura leva `fig-alt="..."`.
    - Figuras de dados vêm de dados reais (gráficos via matplotlib / `kd-scientific-visualization`; 3D e perfis via CalcBoard). **Nunca** use ilustração gerada por IA no lugar de resultado. Diagramas conceituais devem ser claramente distinguíveis de dados.
    - Para limite de páginas, use `uah-publish: {page-limit: N}` no YAML.
+   - Equações numeradas: `{#eq-x}` (Quarto numera) ou `\tag{143}` (numeração própria do texto). Os dois saem com número no DOCX; o `\tag` só se compilar pelo `pubdoc.py render`, nunca por `quarto render` direto.
+   - Títulos que já trazem número ("1.1", "Parte A") pedem `number-sections: false`; o preflight reprova a numeração dupla.
 4. **Preflight (antes de compilar):** `pubdoc.py preflight publication`. Corrija todo `FAIL`. Para validar DOI e metadados das referências, use a skill `kd-citation-management`, o que exige rede e deve ser pedido ao usuário.
 5. **Compilar:** durante a edição, só o formato principal: `pubdoc.py render publication`. Na entrega, todos: `pubdoc.py render publication --all`. Figuras SVG são convertidas para PDF no caminho LaTeX (rsvg-convert ou LibreOffice).
 6. **Verificar:** `pubdoc.py verify publication`. Ele confere saídas, páginas e limite, fontes embutidas, referências não resolvidas e integridade do DOCX, e gera `outputs/manifest.json`.
@@ -63,4 +65,6 @@ Regras de decisão:
 
 - A prévia do DOCX usa o LibreOffice. Sem `libreoffice-math`, as equações não aparecem na prévia, mas estão no arquivo; o `verify` avisa.
 - PDF e DOCX não têm paginação idêntica: valide cada formato.
+- No DOCX, um item de lista **numerada** que contém só uma equação com `\tag` sai com marcador em vez de número (limitação do Pandoc). Ponha uma palavra antes da equação no item.
+- Antes de entregar um DOCX, compare com um documento anterior que o usuário aprovou (ex.: o pipeline `ref_rck`). Números de equação, tabelas e quadros são obrigatórios.
 - A formatação ABNT do `reference-abnt.docx` cobre margens, fonte, entrelinha, recuo, legendas e referências. Capa, folha de rosto e elementos pré-textuais da NBR 14724 ficam por conta do documento.
