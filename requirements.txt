@@ -1,0 +1,3 @@
+# Versões usadas nos testes (lock). Quarto é fixado no workflow (QUARTO_VERSION).
+PyYAML==6.0.3
+pillow==12.3.0

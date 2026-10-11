@@ -1,0 +1,35 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  QUARTO_VERSION: "1.10.19"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install Python dependencies (lock)
+        run: python -m pip install -r requirements.txt
+      - name: Install poppler-utils
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils
+      - name: Install Quarto (pinned)
+        run: |
+          curl -sSL -o quarto.tgz "https://github.com/quarto-dev/quarto-cli/releases/download/v${QUARTO_VERSION}/quarto-${QUARTO_VERSION}-linux-amd64.tar.gz"
+          mkdir -p "$HOME/.local/quarto" && tar -xzf quarto.tgz -C "$HOME/.local/quarto" --strip-components=1
+          echo "$HOME/.local/quarto/bin" >> "$GITHUB_PATH"
+      - name: Doctor
+        run: python publish-documents/scripts/pubdoc.py doctor || true
+      - name: Tests
+        run: python -m unittest discover -s tests -v

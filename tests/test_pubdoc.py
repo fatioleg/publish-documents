@@ -215,5 +215,61 @@ class RenderIntegration(Base):
         self.assertIn("excede o limite de 1", out.stdout)
 
 
+class CodexAuditPubdoc(Base):
+    """Auditoria do Codex: lock de render, includes nas verificações, contenção do SVG→PDF."""
+
+    def test_preflight_checks_included_files(self):
+        pub = self.new("word-editable")
+        (pub / "capitulo.qmd").write_text("Ver [@fantasma2020] e @fig-sumida.\n\n![x](assets/nao-existe.svg)\n")
+        self.edit(pub, "# Conclusões", "{{< include capitulo.qmd >}}\n\n{{< include sumiu.qmd >}}\n\n# Conclusões")
+        out = sh("preflight", "pub", cwd=self.root)
+        self.assertEqual(out.returncode, 1)
+        for text in ("citação sem entrada na bibliografia: @fantasma2020", "referência cruzada sem rótulo: @fig-sumida",
+                     "figura não encontrada: assets/nao-existe.svg", "arquivo incluído não encontrado: sumiu.qmd"):
+            self.assertIn(text, out.stdout)
+
+    @unittest.skipUnless(shutil.which("quarto"), "Quarto não instalado neste ambiente")
+    def test_render_lock_binds_outputs_to_sources(self):
+        pub = self.new("word-editable")
+        (pub / "anexo.qmd").write_text("Texto do anexo.\n")
+        self.edit(pub, "# Conclusões", "{{< include anexo.qmd >}}\n\n# Conclusões")
+        self.assertEqual(sh("render", "pub", cwd=self.root).returncode, 0)
+        lock = json.loads((pub / "outputs/render.lock.json").read_text())
+        sources = lock["outputs"]["outputs/document.docx"]["sources"]
+        self.assertIn("anexo.qmd", sources)
+        self.assertIn("references.bib", sources)
+        self.assertEqual(sh("verify", "pub", cwd=self.root).returncode, 0)
+        # bibliografia e include mudam depois do render: a saída antiga não pode ficar "verificada"
+        bib = pub / "references.bib"
+        bib.write_text(bib.read_text() + "\n% alterado\n")
+        (pub / "anexo.qmd").write_text("Texto do anexo, revisado.\n")
+        out = sh("verify", "pub", cwd=self.root)
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("compilado com fontes diferentes das atuais", out.stdout)
+        self.assertIn("anexo.qmd", out.stdout)
+        self.assertEqual(sh("render", "pub", cwd=self.root).returncode, 0)
+        self.assertEqual(sh("verify", "pub", cwd=self.root).returncode, 0)
+        with open(pub / "outputs/document.docx", "ab") as fh:
+            fh.write(b"adulterado")
+        self.assertIn("alterado depois do render", sh("verify", "pub", cwd=self.root).stdout)
+
+    def test_verify_requires_render_record(self):
+        pub = self.new("word-editable")
+        (pub / "outputs" / "document.docx").write_bytes(b"PK fake")
+        self.assertIn("sem registro em render.lock.json", sh("verify", "pub", cwd=self.root).stdout)
+
+    @unittest.skipUnless(shutil.which("quarto"), "Quarto não instalado neste ambiente")
+    def test_svg_outside_publication_is_not_written(self):
+        pub = self.new("journal-scientific")
+        fora = self.root / "figuras"
+        fora.mkdir()
+        (fora / "f.svg").write_text((pub / "assets/exemplo.svg").read_text())
+        self.edit(pub, "](assets/exemplo.svg)", "](../figuras/f.svg)")
+        out = sh("render", "pub", cwd=self.root)
+        self.assertEqual(out.returncode, 3)
+        self.assertIn("fora da publicação", out.stderr)
+        self.assertFalse((fora / "f.pdf").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

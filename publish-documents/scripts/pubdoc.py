@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover
     print("pubdoc precisa de PyYAML: python3 -m pip install pyyaml", file=sys.stderr)
     raise SystemExit(2)
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 SKILL = Path(__file__).resolve().parents[1]
 TEMPLATES = SKILL / "templates"
 PROFILES = {
@@ -233,14 +233,69 @@ IMG_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)(\{[^}]*\})?")
 BIB_KEY_RE = re.compile(r"@\w+\s*\{\s*([^,\s]+)\s*,")
 
 
-def included_texts(root: Path, body: str) -> list[str]:
-    """Conteúdo dos arquivos de {{< include … >}} (um nível), para contar \\tag e rótulos também neles."""
+INCLUDE_RE = re.compile(r"\{\{<\s*include\s+([^\s>]+)\s*>\}\}")
+
+
+def include_files(root: Path, body: str, base: Path | None = None, seen: set | None = None) -> list[Path]:
+    """Arquivos de {{< include … >}}, recursivamente (caminho relativo ao arquivo que inclui)."""
+    base = base or root
+    seen = set() if seen is None else seen
     out = []
-    for rel in re.findall(r"\{\{<\s*include\s+([^\s>]+)\s*>\}\}", body):
-        path = root / rel
-        if path.is_file():
-            out.append("\n" + path.read_text(encoding="utf-8"))
+    for rel in INCLUDE_RE.findall(body):
+        path = Path(os.path.normpath(base / rel.strip("'\"")))
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        out.append(path)
+        out += include_files(root, path.read_text(encoding="utf-8"), path.parent, seen)
     return out
+
+
+def missing_includes(root: Path, body: str) -> list[str]:
+    return [rel for rel in INCLUDE_RE.findall(body) if not (root / rel.strip("'\"")).is_file()]
+
+
+def included_texts(root: Path, body: str) -> list[str]:
+    """Conteúdo de todos os arquivos incluídos (recursivo)."""
+    return ["\n" + path.read_text(encoding="utf-8") for path in include_files(root, body)]
+
+
+def rel_to(root: Path, path: Path) -> str:
+    return os.path.relpath(os.path.realpath(path), os.path.realpath(root)).replace(os.sep, "/")
+
+
+def source_files(root: Path, qmd: Path, meta: dict, body: str) -> list[Path]:
+    """Tudo o que influencia a compilação: documento, includes, config, bibliografia, CSL, templates,
+    extensões, assets e figuras referenciadas (mesmo fora de assets/)."""
+    paths = [qmd, root / "_quarto.yml", *include_files(root, body)]
+    bibs = meta.get("bibliography") or []
+    paths += [root / b for b in ([bibs] if isinstance(bibs, str) else bibs)]
+    if meta.get("csl"):
+        paths.append(root / meta["csl"])
+    for folder in ("assets", "csl", "templates", "_extensions"):
+        if (root / folder).is_dir():
+            paths += [p for p in sorted((root / folder).rglob("*")) if p.is_file()]
+    full = strip_code(body + "".join(included_texts(root, body)))
+    for img, _attrs in IMG_RE.findall(full):
+        if not re.match(r"https?://", img):
+            paths.append(root / img)
+            pdf = (root / img).with_suffix(".pdf")
+            if img.lower().endswith(".svg") and pdf.is_file():
+                paths.append(pdf)
+    unique, seen = [], set()
+    for path in paths:
+        key = os.path.realpath(path)
+        if path.is_file() and key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def source_hashes(root: Path, qmd: Path, meta: dict, body: str) -> dict[str, str]:
+    return {rel_to(root, p): sha256(p) for p in source_files(root, qmd, meta, body)}
+
+
+LOCK_NAME = "render.lock.json"
 
 
 def strip_code(body: str) -> str:
@@ -272,7 +327,10 @@ def cmd_preflight(root: Path) -> int:
     if csl and not (root / csl).is_file():
         add("FAIL", f"estilo CSL não encontrado: {csl}")
 
-    text = strip_code(body)
+    for rel in missing_includes(root, body):
+        add("FAIL", f"arquivo incluído não encontrado: {rel}")
+    # Includes entram em TODAS as verificações (citações, cross-refs, figuras, equações, títulos).
+    text = strip_code(body + "".join(included_texts(root, body)))
     numbered = any(isinstance(cfg, dict) and cfg.get("number-sections")
                    for cfg in ((meta.get("format") or {}).values() if isinstance(meta.get("format"), dict) else []))
     numbered = numbered or bool(meta.get("number-sections"))
@@ -282,7 +340,7 @@ def cmd_preflight(root: Path) -> int:
     if numbered and hand:
         add("FAIL", f"{len(hand)} título(s) já numerados à mão (ex.: «{hand[0][:40]}») com number-sections: true "
                     "— a numeração sai dupla; desligue number-sections ou marque-os com {{.unnumbered}}")
-    full = text + "".join(included_texts(root, body))
+    full = text
     tags = expected_tags(full)
     if tags:
         add("INFO", f"{len(tags)} equação(ões) com \\tag{{}}: numeradas no PDF pelo LaTeX e no DOCX pelo pubdoc")
@@ -291,7 +349,7 @@ def cmd_preflight(root: Path) -> int:
             add("FAIL", f"equação #eq-{m.group(2)} tem \\tag e rótulo do Quarto ao mesmo tempo: use um dos dois")
     for env in re.findall(r"\\begin\{(equation|align|gather|multline)\*?\}(?:(?!\\end\{).)*?\\tag", full, re.S):
         add("WARN", f"\\tag dentro de \\begin{{{env}}} cru: o DOCX perde essa equação; use $$ … \\tag{{n}} $$")
-    labels = set(LABEL_RE.findall(text)) | set(CHUNK_LABEL_RE.findall(body))
+    labels = set(LABEL_RE.findall(text)) | set(CHUNK_LABEL_RE.findall(body + "".join(included_texts(root, body))))
     refs = set(CITE_RE.findall(text))
     crossrefs = {r for r in refs if r.startswith(CROSSREF_PREFIXES)}
     citations = {r for r in refs - crossrefs if "." not in r[-1:]}
@@ -357,13 +415,19 @@ def svg_to_pdf(root: Path, body: str) -> list[str]:
     """LaTeX precisa de PDF para figuras SVG; o Quarto reaproveita <figura>.pdf se já existir.
     Usa rsvg-convert se houver; senão, o LibreOffice (headless)."""
     notes = []
-    for path, _attrs in IMG_RE.findall(strip_code(body)):
+    for path, _attrs in IMG_RE.findall(strip_code(body + "".join(included_texts(root, body)))):
         svg = root / path
         if not path.lower().endswith(".svg") or not svg.is_file():
             continue
         pdf = svg.with_suffix(".pdf")
         if pdf.is_file() and pdf.stat().st_mtime >= svg.stat().st_mtime:
             continue
+        try:
+            Path(os.path.realpath(svg)).relative_to(Path(os.path.realpath(root)))
+        except ValueError:
+            raise PubError(f"figura SVG fora da publicação ({path}) sem PDF atualizado ao lado: o pubdoc não "
+                           "escreve fora da pasta da publicação — gere o PDF na origem (ex.: figs.py render) "
+                           "ou copie a figura para assets/") from None
         if shutil.which("rsvg-convert"):
             out = run(["rsvg-convert", "-f", "pdf", "-a", "-o", str(pdf), str(svg)])
         elif shutil.which("soffice") or shutil.which("libreoffice"):
@@ -509,6 +573,21 @@ def cmd_render(root: Path, all_formats: bool, to: str | None) -> int:
                 note = f" ({numbered} equação(ões) numerada(s))" if numbered else ""
                 if left:
                     ok, note = False, f" ({left} marcador(es) de \\tag sem equação antes — veja o verify)"
+        if ok:
+            ext = FORMAT_EXT.get(fmt, fmt)
+            output = root / "outputs" / f"{qmd.stem}.{ext}"
+            if output.is_file():
+                lock_path = root / "outputs" / LOCK_NAME
+                lock = {}
+                if lock_path.is_file():
+                    try:
+                        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+                    except ValueError:
+                        lock = {}
+                lock.setdefault("outputs", {})[rel_to(root, output)] = {
+                    "format": fmt, "sha256": sha256(output), "rendered_at": now_iso(),
+                    "sources": source_hashes(root, qmd, meta, body), "pubdoc_version": VERSION}
+                lock_path.write_text(json.dumps(lock, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         status |= 0 if ok else 1
         print(f"render {fmt}: {'OK' if ok else 'FALHOU'}{note}")
         if not ok:
@@ -650,6 +729,13 @@ def cmd_verify(root: Path) -> int:
     add = lambda level, msg: results.append((level, msg))  # noqa: E731
     exts = sorted({FORMAT_EXT.get(f, f) for f in formats_of(meta)})
     outputs = []
+    current_sources = source_hashes(root, qmd, meta, body)
+    lock = {}
+    if (outdir / LOCK_NAME).is_file():
+        try:
+            lock = json.loads((outdir / LOCK_NAME).read_text(encoding="utf-8"))
+        except ValueError:
+            add("FAIL", f"{LOCK_NAME} ilegível — recompile")
     for ext in exts:
         path = outdir / f"{qmd.stem}.{ext}"
         if not path.is_file() or path.stat().st_size == 0:
@@ -657,20 +743,23 @@ def cmd_verify(root: Path) -> int:
             add("FAIL" if ext == primary_ext else "WARN", f"saída ausente: outputs/{path.name}"
                 + (" (formato principal do perfil)" if ext == primary_ext else " (rode render --all para gerar)"))
             continue
-        if path.stat().st_mtime < qmd.stat().st_mtime:
-            add("WARN", f"outputs/{path.name} é mais antigo que document.qmd — recompile")
+        entry = (lock.get("outputs") or {}).get(rel_to(root, path))
+        if entry is None:
+            add("FAIL", f"outputs/{path.name} sem registro em {LOCK_NAME} — compile com `pubdoc.py render`")
+        else:
+            if entry.get("sha256") != sha256(path):
+                add("FAIL", f"outputs/{path.name} foi alterado depois do render (hash difere do registro)")
+            old, new = entry.get("sources") or {}, current_sources
+            changed = sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))
+            if changed:
+                add("FAIL", f"outputs/{path.name} foi compilado com fontes diferentes das atuais — recompile "
+                            f"({len(changed)} arquivo(s): {', '.join(changed[:5])})")
         outputs.append(path)
         if ext == "pdf":
             pdf_checks(path, review, page_limit, add)
         elif ext == "docx":
             docx_checks(path, review, page_limit, add, expected)
 
-    sources = [qmd, root / "_quarto.yml"]
-    bibs = meta.get("bibliography") or []
-    sources += [root / b for b in ([bibs] if isinstance(bibs, str) else bibs)]
-    for folder in ("assets", "csl", "templates", "_extensions"):
-        if (root / folder).is_dir():
-            sources += [p for p in sorted((root / folder).rglob("*")) if p.is_file()]
     manifest = {
         "pubdoc_version": VERSION,
         "generated_at": now_iso(),
@@ -681,8 +770,10 @@ def cmd_verify(root: Path) -> int:
             "typst": tool_version(["quarto", "typst", "--version"]),
             "lualatex": tool_version(["lualatex", "--version"]),
         },
-        "sources": {p.relative_to(root).as_posix(): sha256(p) for p in sources if p.is_file()},
-        "outputs": {p.relative_to(root).as_posix(): sha256(p) for p in outputs},
+        "sources": current_sources,
+        "outputs": {rel_to(root, p): sha256(p) for p in outputs},
+        "rendered_from": {k: v.get("sources") for k, v in (lock.get("outputs") or {}).items()
+                          if k in {rel_to(root, p) for p in outputs}},
         "checks": [{"level": lvl, "message": msg} for lvl, msg in results],
         "accepted": False,
     }

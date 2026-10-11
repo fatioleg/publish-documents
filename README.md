@@ -66,7 +66,21 @@ Com o UAH: `uah.py integrations install publish-documents`.
 python3 -m unittest discover -s tests -v
 ```
 
-São 15 testes. Os de integração compilam os três perfis de verdade quando o Quarto e o XeLaTeX estão instalados.
+São 19 testes. Os de integração compilam os três perfis de verdade quando o Quarto e o XeLaTeX estão instalados.
+O CI do GitHub roda a suíte com o Quarto fixado (`QUARTO_VERSION`) e as dependências de `requirements.txt`.
+
+## Rastreabilidade do render
+
+Cada `render` grava `outputs/render.lock.json` com o hash da saída e os hashes de **todas** as fontes usadas
+naquela compilação: documento, arquivos de `{{< include >}}` (recursivo), bibliografia, CSL, templates,
+extensões, assets e figuras referenciadas. O `verify` reprova a saída quando:
+
+- não há registro de render para ela;
+- a saída foi alterada depois do render;
+- qualquer fonte mudou desde a compilação.
+
+O preflight aplica as verificações de citações, referências cruzadas, figuras e equações também aos arquivos
+incluídos. A conversão SVG→PDF para o LaTeX nunca grava fora da pasta da publicação.
 
 ## Licença
 
